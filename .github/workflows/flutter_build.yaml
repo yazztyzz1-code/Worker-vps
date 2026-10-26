@@ -1,0 +1,132 @@
+name: Flutter Build APK (Fast)
+
+# Workflow build cepat untuk bot Telegram
+# Path di repo: .github/workflows/flutter_build_fast.yaml
+# Bot kirim input: zip_url, tag, build_type, build_speed
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag unik build"
+        required: true
+        type: string
+      build_type:
+        description: "debug atau release"
+        required: false
+        default: "release"
+        type: string
+      build_speed:
+        description: "fast atau normal"
+        required: false
+        default: "fast"
+        type: string
+
+jobs:
+  build:
+    # Default: ubuntu-latest (aman, tidak nunggu runner)
+    # Untuk VPS self-hosted, ganti jadi:
+    #   runs-on: [self-hosted, vps-fast]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Free disk (GitHub-hosted only)
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+            /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h /
+
+      - name: Validasi input
+        run: |
+          test -n "${{ inputs.zip_url }}" || { echo "::error::zip_url kosong"; exit 1; }
+          test -n "${{ inputs.tag }}" || { echo "::error::tag kosong"; exit 1; }
+          echo "speed=${{ inputs.build_speed }} type=${{ inputs.build_type }} tag=${{ inputs.tag }}"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter 3.41.9
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+
+      - name: Download & extract ZIP
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-delay 2 -o project.zip "$ZIP_URL"
+          rm -rf project && mkdir -p project
+          unzip -q project.zip -d project
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp=$(mktemp -d)
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project && mv "$tmp" project
+          fi
+          test -f project/pubspec.yaml || { echo "::error::pubspec.yaml tidak ada"; exit 1; }
+
+      - name: Pub get + optimasi Gradle (FAST)
+        working-directory: project
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter pub get
+
+          mkdir -p android
+          # Gradle parallel + heap besar = compile lebih cepat
+          cat > android/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.daemon=true
+          org.gradle.configureondemand=true
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          # Kalau sudah ada gradle.properties, merge flag penting
+          if [ -f android/gradle.properties.bak ]; then true; fi
+
+      - name: Build APK
+        working-directory: project
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=true -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+        run: |
+          set -euo pipefail
+          SPEED="${{ inputs.build_speed }}"
+          TYPE="${{ inputs.build_type }}"
+
+          if [ "$TYPE" = "debug" ]; then
+            # Debug jauh lebih cepat dari release
+            flutter build apk --debug --no-tree-shake-icons
+          else
+            if [ "$SPEED" = "fast" ]; then
+              # Release cepat: target arm64 saja (ukuran lebih kecil & compile lebih singkat)
+              flutter build apk --release --target-platform android-arm64 --no-tree-shake-icons
+            else
+              # Normal: semua ABI
+              flutter build apk --release
+            fi
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: |
+            project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 1
